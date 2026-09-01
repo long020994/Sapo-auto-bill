@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         Sapo POS - Agent theo target (v22.6)
+// @name         Sapo POS - Agent theo target (v22.8)
 // @namespace    http://tampermonkey.net/
-// @version      22.6.0
+// @version      22.8.0
 // @description  Lập giỏ tự nhiên theo target, mỗi mã dưới 5 món, kiểm tra lại trước khi thanh toán.
 // @author       You
 // @match        *://*.mysapo.net/admin/pos*
@@ -15,7 +15,7 @@
 (function () {
     'use strict';
 
-    const VERSION = '22.6.0';
+    const VERSION = '22.8.0';
     const STORAGE = {
         running: 'sapo_is_running_v22',
         queue: 'sapo_auto_queue_v22',
@@ -25,11 +25,16 @@
     const CFG = {
         // Quy tắc planning: mọi dòng hàng phải có quantity 1..4 (luôn dưới 5).
         maxQty: 4,
+        maxTarget: 5000000,
+        maxQueue: 100,
+        maxScaledTarget: 200000,
         cacheMs: 30 * 60 * 1000,
         pageSize: 250,
         maxPages: 50,
-        selectAttempts: 7,
-        candidatesPerAttempt: 260,
+        selectAttempts: 3,
+        candidatesPerAttempt: 140,
+        plannerBudgetMs: 1600,
+        plannerMaxWrites: 240000,
         waitSuggestionMs: 8000,
         waitCartMs: 9000,
         verifyTolerance: 0,
@@ -37,7 +42,9 @@
     };
 
     let loopBusy = false;
+    let cachedCartTotalLabel = null;
     const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+    const yieldToBrowser = () => globalThis.scheduler?.yield ? globalThis.scheduler.yield() : sleep(0);
     const norm = value => String(value == null ? '' : value)
         .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
         .toLowerCase().replace(/\s+/g, ' ').trim();
@@ -77,6 +84,24 @@
     function setQueue(queue) { localStorage.setItem(STORAGE.queue, JSON.stringify(queue)); }
     function isRunning() { return localStorage.getItem(STORAGE.running) === 'true'; }
     function setRunning(value) { localStorage.setItem(STORAGE.running, value ? 'true' : 'false'); }
+
+    function sanitizeStoredQueue() {
+        const raw = readJson(STORAGE.queue, []);
+        if (!Array.isArray(raw)) {
+            setQueue([]); setRunning(false);
+            return 'Đã chặn hàng đợi bị hỏng.';
+        }
+        const valid = raw.slice(0, CFG.maxQueue).map(parseApiNumber)
+            .map(Math.round)
+            .filter(value => Number.isSafeInteger(value) && value > 0 && value <= CFG.maxTarget);
+        const changed = valid.length !== raw.length || valid.some((value, index) => value !== raw[index]);
+        if (changed) {
+            setQueue(valid);
+            setRunning(false);
+            return `Đã loại target không an toàn. Agent đang tạm dừng; còn ${valid.length} target hợp lệ.`;
+        }
+        return '';
+    }
 
     function updateStatus(message, isError = false) {
         const el = document.getElementById('sapoAutoStatus');
@@ -119,6 +144,9 @@
                 .map(x => parseApiNumber(x.replace(/[,\s]/g, '')))
                 .filter(x => x > 0).map(x => Math.round(x * 1000));
             if (!amounts.length) return alert('Vui lòng nhập ít nhất một số tiền hợp lệ.');
+            if (amounts.length > CFG.maxQueue) return alert(`Chỉ được chạy tối đa ${CFG.maxQueue} hóa đơn mỗi lần.`);
+            const unsafe = amounts.find(value => !Number.isSafeInteger(value) || value > CFG.maxTarget);
+            if (unsafe) return alert(`Target tối đa là ${formatVnd(CFG.maxTarget)}. Danh sách chưa được chạy.`);
             setQueue(amounts); setRunning(true); renderUI(); startBulkLoop();
         });
         panel.querySelector('#sapoToggle')?.addEventListener('click', () => {
@@ -242,7 +270,18 @@
         shuffle(valid.filter(p => !history.has(p.key))).slice(0, 70).forEach(p => map.set(p.key, p));
         shuffle(valid).slice(attempt * 25, attempt * 25 + 70).forEach(p => map.set(p.key, p));
 
-        return shuffle([...map.values()]).slice(0, CFG.candidatesPerAttempt + 70);
+        // Nhiều SKU có cùng giá tạo ra trạng thái DP giống hệt nhau. Chỉ giữ
+        // tối đa 6 SKU/mức giá trong mỗi attempt để giảm mạnh CPU và bộ nhớ.
+        const perPrice = new Map();
+        const balanced = [];
+        for (const product of shuffle([...map.values()])) {
+            const count = perPrice.get(product.salePrice) || 0;
+            if (count >= 6) continue;
+            perPrice.set(product.salePrice, count + 1);
+            balanced.push(product);
+            if (balanced.length >= CFG.candidatesPerAttempt + 40) break;
+        }
+        return balanced;
     }
 
     function exactBoundedKnapsack(products, target) {
@@ -316,13 +355,17 @@
         return null;
     }
 
-    function naturalBoundedKnapsack(products, target) {
+    async function naturalBoundedKnapsack(products, target) {
         if (!products.length || target <= 0) return null;
+        const startedAt = globalThis.performance?.now?.() ?? Date.now();
+        let stateWrites = 0;
+        let transitions = 0;
         let scale = target;
         for (const p of products) scale = gcd(scale, p.salePrice);
         const targetU = Math.round(target / scale);
+        if (targetU > CFG.maxScaledTarget) return null;
         const idealLines = Math.max(4, Math.min(8, Math.round(3 + target / 75000)));
-        const maxLines = Math.min(14, idealLines + 6);
+        const maxLines = Math.min(12, idealLines + 4);
         const minLines = target < 50000 ? 2 : Math.max(3, idealLines - 3);
         const sortedPrices = products.map(p => p.salePrice).sort((a, b) => a - b);
         const bottomPrice = sortedPrices[Math.floor((sortedPrices.length - 1) * 0.2)] || 0;
@@ -335,7 +378,13 @@
         );
         states[0][0].set(0, { score: 0, node: null });
 
-        for (const product of products) {
+        productLoop: for (let productIndex = 0; productIndex < products.length; productIndex++) {
+            const product = products[productIndex];
+            if (productIndex % 6 === 0) {
+                await yieldToBrowser();
+                const now = globalThis.performance?.now?.() ?? Date.now();
+                if (now - startedAt > CFG.plannerBudgetMs) break productLoop;
+            }
             const priceU = Math.round(product.salePrice / scale);
             const max = Math.min(CFG.maxQty, Math.max(0, product.inventory || CFG.maxQty));
             const optionScore = new Array(max + 1).fill(0);
@@ -359,12 +408,20 @@
                     const bases = [...states[lines][ones].entries()];
                     for (const [baseSum, baseState] of bases) {
                         for (let qty = 1; qty <= max; qty++) {
+                            transitions++;
+                            if (transitions % 50000 === 0) {
+                                await yieldToBrowser();
+                                const now = globalThis.performance?.now?.() ?? Date.now();
+                                if (now - startedAt > CFG.plannerBudgetMs) break productLoop;
+                            }
                             const sum = baseSum + priceU * qty;
                             if (sum > targetU) break;
                             const nextOnes = ones + (qty === 1 ? 1 : 0);
                             const score = baseState.score + optionScore[qty];
                             const old = states[lines + 1][nextOnes].get(sum);
                             if (!old || score > old.score) {
+                                stateWrites++;
+                                if (stateWrites > CFG.plannerMaxWrites) break productLoop;
                                 states[lines + 1][nextOnes].set(sum, {
                                     score,
                                     node: { product, qty, previous: baseState.node }
@@ -426,12 +483,13 @@
         return score;
     }
 
-    function selectProducts(products, target) {
+    async function selectProducts(products, target) {
+        const plannerStartedAt = globalThis.performance?.now?.() ?? Date.now();
         const valid = products.filter(p => Number.isInteger(p.salePrice) && p.salePrice > 0 && p.salePrice <= target);
         let best = null;
         for (let attempt = 0; attempt < CFG.selectAttempts; attempt++) {
             updateStatus(`Đang tối ưu giỏ tự nhiên ${formatVnd(target)} (${attempt + 1}/${CFG.selectAttempts})…`);
-            const selected = naturalBoundedKnapsack(buildCandidatePool(valid, target, attempt), target);
+            const selected = await naturalBoundedKnapsack(buildCandidatePool(valid, target, attempt), target);
             if (selected?.length) {
                 const merged = new Map();
                 for (const item of selected) {
@@ -445,7 +503,15 @@
                     if (!best || score > best.score) best = { result, score };
                 }
             }
+            await yieldToBrowser();
         }
+        const plannerFinishedAt = globalThis.performance?.now?.() ?? Date.now();
+        console.log('[Sapo Agent] planner finished', {
+            target,
+            durationMs: Math.round(plannerFinishedAt - plannerStartedAt),
+            attempts: CFG.selectAttempts,
+            found: Boolean(best)
+        });
         if (!best) return null;
         const result = shuffle(best.result);
         localStorage.setItem(STORAGE.history, JSON.stringify(result.map(x => x.key)));
@@ -632,27 +698,34 @@
     }
 
     function cartContainers() {
+        const exactControls = [...document.querySelectorAll('.order-line-item-quantity')].filter(isVisible);
+        if (exactControls.length || document.querySelector('#main_layout')) {
+            return [...new Set(exactControls.map(rowFromQuantityControl).filter(Boolean))];
+        }
+
+        // Chỉ dùng fallback cho phiên bản Sapo không có class ổn định ở trên.
+        // Không quét toàn bộ button của document vì thao tác đó gây layout thrashing.
         const selectors = ['tr', '[role="row"]', '[data-testid*="cart-item"]', '[class*="cart-item"]', '[class*="order-item"]', '[class*="product-item"]', '[class*="line-item"]'];
         const set = new Set();
         selectors.forEach(s => document.querySelectorAll(s).forEach(el => {
             if (isVisible(el) && !el.closest('[role="listbox"],.MuiAutocomplete-popper,.MuiPopover-root')) set.add(el);
         }));
-        for (const button of [...document.querySelectorAll('button,[role="button"]')].filter(isVisible)) {
-            let parent = button.parentElement;
-            for (let level = 0; level < 3 && parent; level++, parent = parent.parentElement) {
-                const control = quantityControlIn(parent);
-                if (control) {
-                    const row = rowFromQuantityControl(control);
-                    if (row) set.add(row);
-                    break;
-                }
-            }
-        }
         return [...set].filter(el => quantityControlIn(el));
     }
 
     function findCartRow(item) {
-        const set = new Set(cartContainers());
+        const containers = cartContainers();
+        const rank = list => list.map(el => {
+            const rect = el.getBoundingClientRect();
+            const score = scoreCartRow(el.textContent, item) + (quantityControlIn(el) ? 30 : 0) - Math.min(20, rect.height / 20);
+            return { el, score };
+        }).filter(x => x.score > 20).sort((a, b) => b.score - a.score)[0]?.el || null;
+
+        const direct = rank(containers);
+        if (direct || document.querySelector('#main_layout')) return direct;
+
+        // Legacy fallback: chỉ quét text khi class chính thức không tồn tại.
+        const set = new Set(containers);
         for (const anchor of textAnchorsFor(item)) {
             let current = anchor;
             for (let level = 0; level < 9 && current && current !== document.body; level++, current = current.parentElement) {
@@ -663,11 +736,7 @@
                 }
             }
         }
-        return [...set].map(el => {
-            const rect = el.getBoundingClientRect();
-            const score = scoreCartRow(el.textContent, item) + (quantityControlIn(el) ? 30 : 0) - Math.min(20, rect.height / 20);
-            return { el, score };
-        }).filter(x => x.score > 20).sort((a, b) => b.score - a.score)[0]?.el || null;
+        return rank([...set]);
     }
 
     function readQuantity(row) {
@@ -737,21 +806,28 @@
     }
 
     function getCartTotalUI() {
-        const labels = [];
-        const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
-        let textNode;
-        while ((textNode = walker.nextNode())) {
-            const t = norm(textNode.nodeValue);
-            if (t === 'khach phai tra' || t === 'khach can tra' || t === 'tong tien' || t === 'tong thanh toan') {
-                if (textNode.parentElement && isVisible(textNode.parentElement)) labels.push(textNode.parentElement);
+        if (!cachedCartTotalLabel?.isConnected || !isVisible(cachedCartTotalLabel)) {
+            cachedCartTotalLabel = null;
+            const root = document.querySelector('#main_layout') || document.body;
+            const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+            let textNode;
+            while ((textNode = walker.nextNode())) {
+                const t = norm(textNode.nodeValue);
+                if (t === 'khach phai tra' || t === 'khach can tra' || t === 'tong thanh toan') {
+                    const el = textNode.parentElement;
+                    if (el && isVisible(el) && !el.closest('#paymentPopup,[role="dialog"]')) {
+                        cachedCartTotalLabel = el;
+                        break;
+                    }
+                }
             }
         }
-        for (const label of labels) {
-            const scopes = [label.parentElement, label.parentElement?.parentElement, label.nextElementSibling].filter(Boolean);
-            for (const scope of scopes) {
-                const value = parseVndText(scope.textContent.replace(label.textContent, ''));
-                if (value >= 0 && /\d/.test(scope.textContent.replace(label.textContent, ''))) return value;
-            }
+        const label = cachedCartTotalLabel;
+        if (!label) return 0;
+        const scopes = [label.parentElement, label.parentElement?.parentElement, label.nextElementSibling].filter(Boolean);
+        for (const scope of scopes) {
+            const rest = scope.textContent.replace(label.textContent, '');
+            if (/\d/.test(rest)) return parseVndText(rest);
         }
         return 0;
     }
@@ -892,11 +968,13 @@
     }
 
     async function processTarget(target) {
-        if (!Number.isInteger(target) || target <= 0) throw new Error('Target không hợp lệ.');
+        if (!Number.isSafeInteger(target) || target <= 0 || target > CFG.maxTarget) {
+            throw new Error(`Target không an toàn. Giá trị tối đa là ${formatVnd(CFG.maxTarget)}.`);
+        }
 
         // Lập và khóa kế hoạch trước khi đụng vào giỏ hàng.
         const products = await fetchLatestProducts();
-        const selected = selectProducts(products, target);
+        const selected = await selectProducts(products, target);
         if (!selected) throw new Error(`Không tìm được tổ hợp đúng ${formatVnd(target)} với giới hạn ${CFG.maxQty}/món.`);
         const planned = selected.reduce((sum, x) => sum + x.salePrice * x.qty, 0);
         if (planned !== target) throw new Error(`Lỗi nội bộ: tổ hợp ${formatVnd(planned)} khác target.`);
@@ -948,9 +1026,12 @@
     }
 
     function boot() {
+        const safetyMessage = sanitizeStoredQueue();
         renderUI();
+        if (safetyMessage) updateStatus(safetyMessage, true);
         const observer = new MutationObserver(() => { if (!document.getElementById('sapo-auto-panel')) renderUI(); });
-        observer.observe(document.documentElement, { childList: true, subtree: true });
+        // Panel là con trực tiếp của body; không cần theo dõi mọi mutation của SPA.
+        observer.observe(document.body, { childList: true });
         if (isRunning() && getQueue().length) startBulkLoop();
     }
 
